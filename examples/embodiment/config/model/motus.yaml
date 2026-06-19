@@ -1,0 +1,47 @@
+model_type: "motus"
+
+# External Motus checkpoint path.
+model_path: "/root/autodl-tmp/models/motus/Motus_robotwin2"
+precision: "bf16"
+
+# RLinf generic model flags.
+is_lora: False
+lora_rank: 32
+load_to_device: False
+
+# RoboTwin action interface.
+num_action_chunks: 16
+action_dim: 14
+use_proprio: True
+add_value_head: False
+
+motus:
+  repo_path: "/root/autodl-tmp/Motus"
+  policy_path: "/root/autodl-tmp/RLinf/third_party/Motus"
+
+  checkpoint_path: "/root/autodl-tmp/models/motus/Motus_robotwin2"
+  wan_path: "/root/autodl-tmp/models/motus/Wan2.2-TI2V-5B"
+  vlm_path: "/root/autodl-tmp/models/motus/Qwen3-VL-2B-Instruct"
+  config_path: "/root/autodl-tmp/RoboTwin/policy/Motus/utils/robotwin.yml"
+
+  num_inference_timesteps: 10
+  use_t5_cache: True
+  save_predicted_frames: False
+
+  # First integration is deliberately single-env.
+  allow_batch_size: 8
+  batch_inference: True
+  decode_video: False
+
+
+  # RLinf training integration.
+  trainable: "action_expert"
+  freeze_video_model: True
+  freeze_vlm_model: True
+  freeze_und_expert: True
+  freeze_t5_encoder: True
+
+  # First PPO/GRPO logprob implementation will be transition-level πRL.
+  logprob_mode: "flow_sde"
+  logprob_sigma: 0.5
+  collect_denoise_step: "random"
