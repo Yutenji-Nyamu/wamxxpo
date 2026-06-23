@@ -60,6 +60,13 @@ class MotusPolicy(nn.Module, BasePolicy):
         self.num_inference_timesteps = int(motus_cfg.get("num_inference_timesteps", 10))
         self.batch_inference = _as_bool(motus_cfg.get("batch_inference", False), default=False)
         self.decode_video = _as_bool(motus_cfg.get("decode_video", False), default=False)
+        # Qwen-VL processor output length can vary slightly across env steps.
+        # RLinf stacks forward_inputs over rollout time, so VLM token tensors must
+        # use a fixed sequence length just like OpenPI/OpenVLA-OFT use fixed prompt
+        # lengths. 256 covers current RoboTwin Motus prompts (~180-200 tokens).
+        self.vlm_max_seq_len = int(motus_cfg.get("vlm_max_seq_len", 256))
+        if self.vlm_max_seq_len <= 0:
+            raise ValueError(f"motus.vlm_max_seq_len must be positive, got {self.vlm_max_seq_len}")
         self._warned_decode_video_unsupported = False
         self._train_batch_print_count = 0
         self.scene_prefix = str(
@@ -811,14 +818,21 @@ class MotusPolicy(nn.Module, BasePolicy):
         ids_list = [x["input_ids"].squeeze(0).to(device) for x in vlm_inputs_list]
         mask_list = [x["attention_mask"].squeeze(0).to(device) for x in vlm_inputs_list]
         max_len = max(int(x.shape[0]) for x in ids_list)
+        target_len = int(self.vlm_max_seq_len)
+        if max_len > target_len:
+            raise ValueError(
+                f"Motus VLM input length {max_len} exceeds fixed vlm_max_seq_len={target_len}. "
+                "Increase rollout/actor.model.motus.vlm_max_seq_len so forward_inputs can be "
+                "stacked across rollout time, matching OpenPI-style fixed prompt length."
+            )
 
         input_ids = torch.zeros(
-            (len(ids_list), max_len),
+            (len(ids_list), target_len),
             dtype=ids_list[0].dtype,
             device=device,
         )
         attention_mask = torch.zeros(
-            (len(mask_list), max_len),
+            (len(mask_list), target_len),
             dtype=mask_list[0].dtype,
             device=device,
         )

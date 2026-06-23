@@ -181,6 +181,7 @@ actor:
       checkpoint_path: "/root/autodl-tmp/models/motus/Motus_robotwin2"
       wan_path: "/root/autodl-tmp/models/motus/Wan2.2-TI2V-5B"
       vlm_path: "/root/autodl-tmp/models/motus/Qwen3-VL-2B-Instruct"
+      vlm_max_seq_len: 256
       config_path: "/root/autodl-tmp/RoboTwin/policy/Motus/utils/robotwin.yml"
 
       num_inference_timesteps: 10

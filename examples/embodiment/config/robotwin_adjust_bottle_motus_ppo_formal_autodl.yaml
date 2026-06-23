@@ -28,7 +28,7 @@ runner:
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
-  max_steps: 30
+  max_steps: 20
 
   only_eval: False
   val_check_interval: 5
@@ -73,7 +73,7 @@ env:
 
   train:
     rollout_epoch: 4
-    total_num_envs: 16
+    total_num_envs: 32
     reward_coef: ${algorithm.reward_coef}
     # Motus chunk is 16. 160 steps gives 10 policy decisions: longer than
     # OpenPI's 200/50=4 but safer for initial success on adjust_bottle.
@@ -106,7 +106,7 @@ env:
 
   eval:
     rollout_epoch: 1
-    total_num_envs: 4
+    total_num_envs: 16
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 160
@@ -156,8 +156,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 8
-  global_batch_size: 256
+  micro_batch_size: 16
+  global_batch_size: 128
   seed: 1234
   enable_offload: False
 
@@ -181,6 +181,7 @@ actor:
       checkpoint_path: "/root/autodl-tmp/models/motus/Motus_robotwin2"
       wan_path: "/root/autodl-tmp/models/motus/Wan2.2-TI2V-5B"
       vlm_path: "/root/autodl-tmp/models/motus/Qwen3-VL-2B-Instruct"
+      vlm_max_seq_len: 256
       config_path: "/root/autodl-tmp/RoboTwin/policy/Motus/utils/robotwin.yml"
 
       num_inference_timesteps: 10
