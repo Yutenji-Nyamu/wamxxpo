@@ -373,25 +373,39 @@ class MotusPolicy(nn.Module, BasePolicy):
         if value_features is None:
             raise RuntimeError("Motus get_log_prob_value did not return value_features.")
 
+        # FSDP mixed precision casts ValueHead parameters to actor.model.precision
+        # inside the FSDP forward.  Outside that forward the visible/original
+        # parameters may still appear fp32, so parameter dtype is not a reliable
+        # input dtype selector.  Use the Motus model dtype under autocast, matching
+        # the surrounding bf16 Motus forward and avoiding fp32-vs-bf16 Linear
+        # mismatches on actor workers.  On non-CUDA paths, fall back to the actual
+        # ValueHead parameter dtype.
         value_param = next(self.value_head.parameters())
-        value_features = value_features.to(
-            device=value_param.device,
-            dtype=value_param.dtype,
-        )
+        target_dtype = getattr(self.model, "dtype", None) or value_param.dtype
+        if target_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            target_dtype = value_param.dtype
+
+        value_features = value_features.to(device=value_param.device)
         if self.detach_critic_input:
             value_features = value_features.detach()
+
+        def _value_head_forward(x: torch.Tensor) -> torch.Tensor:
+            if x.device.type == "cuda" and target_dtype in (torch.float16, torch.bfloat16):
+                with torch.autocast(device_type="cuda", dtype=target_dtype):
+                    return self.value_head(x)
+            return self.value_head(x.to(dtype=value_param.dtype))
 
         if value_features.dim() == 3:
             # OpenPI rollout computes a value for each denoise step and averages
             # values over the denoise dimension for prev_values.
             bsz, n_steps, hidden = value_features.shape
-            flat_values = self.value_head(value_features.reshape(bsz * n_steps, hidden))
+            flat_values = _value_head_forward(value_features.reshape(bsz * n_steps, hidden))
             return flat_values.reshape(bsz, n_steps, -1).mean(dim=1)[:, :1].float()
         if value_features.dim() != 2:
             raise ValueError(
                 f"Motus value_features must be [B,H] or [B,S,H], got {tuple(value_features.shape)}"
             )
-        return self.value_head(value_features).reshape(value_features.shape[0], -1)[:, :1].float()
+        return _value_head_forward(value_features).reshape(value_features.shape[0], -1)[:, :1].float()
 
     def train(self, mode: bool = True):
         super().train(mode)
