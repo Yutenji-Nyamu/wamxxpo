@@ -916,6 +916,173 @@ class Motus(nn.Module):
         std = std.clamp_min(1e-6)
         return mean.to(action_x_t.dtype), std.to(action_x_t.dtype)
 
+    def _select_trace_step(
+        self,
+        num_inference_steps: int,
+        *,
+        ignore_first: bool = False,
+        ignore_last: bool = False,
+    ) -> int:
+        lo = 1 if ignore_first else 0
+        hi = num_inference_steps - 1 - (1 if ignore_last else 0)
+        if hi < lo:
+            raise ValueError(
+                f"Invalid Motus denoise index range [{lo}, {hi}] for "
+                f"num_inference_steps={num_inference_steps}, "
+                f"ignore_first={ignore_first}, ignore_last={ignore_last}."
+            )
+        return int(torch.randint(lo, hi + 1, (1,), device=self.device).item())
+
+    def _validate_trace_step(
+        self,
+        trace_step: int,
+        num_inference_steps: int,
+        *,
+        ignore_first: bool = False,
+        ignore_last: bool = False,
+    ) -> int:
+        lo = 1 if ignore_first else 0
+        hi = num_inference_steps - 1 - (1 if ignore_last else 0)
+        trace_step = int(trace_step)
+        if not (lo <= trace_step <= hi):
+            raise ValueError(
+                f"Motus trace_step={trace_step} is outside allowed range [{lo}, {hi}] "
+                f"for num_inference_steps={num_inference_steps}, "
+                f"ignore_first={ignore_first}, ignore_last={ignore_last}."
+            )
+        return trace_step
+
+    def get_log_prob_value(
+        self,
+        *,
+        video_chains: torch.Tensor,
+        action_chains: torch.Tensor,
+        denoise_inds: torch.Tensor,
+        state: torch.Tensor = None,
+        language_embeddings=None,
+        vlm_inputs=None,
+        logprob_mode: str = "flow_sde",
+        logprob_sigma: float = 0.5,
+        num_action_chunks: Optional[int] = None,
+        action_dim: Optional[int] = None,
+        compute_values: bool = False,
+        return_value_features: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """Replay Motus denoise chains and recompute selected transition logprob.
+
+        This is the Motus analogue of OpenPI's get_log_prob_value(): rollout
+        stores full denoise chains plus denoise indices, and actor training
+        recomputes the probability of chains[t+1] conditioned on chains[t]
+        under the current parameters.
+        """
+        video_chains = video_chains.to(device=self.device, dtype=self.dtype)
+        action_chains = action_chains.to(device=self.device, dtype=self.dtype)
+        denoise_inds = denoise_inds.to(device=self.device, dtype=torch.long)
+        if denoise_inds.dim() == 2:
+            denoise_ind = denoise_inds[:, 0]
+        elif denoise_inds.dim() == 1:
+            denoise_ind = denoise_inds
+        else:
+            raise ValueError(f"denoise_inds must be [B] or [B,S], got {tuple(denoise_inds.shape)}")
+
+        bsize = action_chains.shape[0]
+        if video_chains.shape[0] != bsize:
+            raise ValueError(
+                f"video/action chain batch mismatch: video={video_chains.shape[0]}, action={bsize}"
+            )
+        num_steps = action_chains.shape[1] - 1
+        if video_chains.shape[1] != num_steps + 1:
+            raise ValueError(
+                f"video/action chain step mismatch: video={video_chains.shape[1]}, action={action_chains.shape[1]}"
+            )
+        if torch.any(denoise_ind < 0) or torch.any(denoise_ind >= num_steps):
+            raise ValueError(
+                f"denoise index out of range for num_steps={num_steps}: {denoise_ind.detach().cpu().tolist()}"
+            )
+
+        batch_indices = torch.arange(bsize, device=self.device)
+        video_latent_t = video_chains[batch_indices, denoise_ind]
+        action_x_t = action_chains[batch_indices, denoise_ind]
+        action_x_next = action_chains[batch_indices, denoise_ind + 1]
+
+        timesteps = torch.linspace(
+            1.0,
+            0.0,
+            num_steps + 1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        t = timesteps[denoise_ind]
+        t_next = timesteps[denoise_ind + 1]
+        dt = t_next - t
+        t_scaled = (t * 1000).to(self.dtype)
+
+        if state is not None:
+            state = state.to(device=self.device, dtype=self.dtype)
+        if language_embeddings is not None:
+            if isinstance(language_embeddings, list):
+                language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
+            else:
+                language_embeddings = language_embeddings.to(self.device).to(self.dtype)
+
+        denoise_out = self.denoise_velocity_step(
+            video_latent=video_latent_t,
+            action_latent=action_x_t,
+            state=state,
+            t_scaled=t_scaled,
+            language_embeddings=language_embeddings,
+            vlm_inputs=vlm_inputs,
+            return_value_features=compute_values or return_value_features,
+        )
+        if compute_values or return_value_features:
+            _video_velocity, action_velocity, _und_tokens, value_features = denoise_out
+        else:
+            _video_velocity, action_velocity, _und_tokens = denoise_out
+            value_features = None
+
+        logprob_mode = str(logprob_mode).lower()
+        if logprob_mode in {"flow_sde", "transition_sde"}:
+            mean_next, std = self.flow_sde_mean_std(
+                action_x_t=action_x_t,
+                action_velocity=action_velocity,
+                t_scaled=t_scaled,
+                dt=dt,
+                noise_level=float(logprob_sigma),
+            )
+            diff = (action_x_next.float() - mean_next.float()) / std.float()
+            log_norm = torch.log(std.float()) + 0.5 * torch.log(
+                2.0 * torch.pi * torch.ones_like(action_x_next.float())
+            )
+            logprobs = -0.5 * diff.pow(2) - log_norm
+        elif logprob_mode in {"transition_velocity", "flow_velocity"}:
+            sigma = float(logprob_sigma)
+            if sigma <= 0:
+                raise ValueError(f"logprob_sigma must be positive, got {sigma}")
+            dt_view = dt
+            while dt_view.dim() < action_x_t.dim():
+                dt_view = dt_view.unsqueeze(-1)
+            target_velocity = (action_x_next - action_x_t) / dt_view
+            diff = (action_velocity.float() - target_velocity.float()) / sigma
+            log_norm = torch.log(torch.tensor(sigma, device=self.device, dtype=torch.float32)) + 0.5 * torch.log(
+                2.0 * torch.pi * torch.ones_like(action_x_next.float())
+            )
+            logprobs = -0.5 * diff.pow(2) - log_norm
+        else:
+            raise ValueError(f"Unsupported Motus logprob_mode={logprob_mode!r}")
+
+        if num_action_chunks is None:
+            num_action_chunks = self.config.action_chunk_size
+        if action_dim is None:
+            action_dim = self.config.action_dim
+        logprobs = logprobs[:, : int(num_action_chunks), : int(action_dim)].float()
+
+        # The third-party Motus model does not own RLinf's ValueHead. For PPO,
+        # return pooled action-token features so the RLinf adapter can compute
+        # values with its ValueHead, matching OpenPI's suffix-feature critic path.
+        values_or_features = value_features if return_value_features else None
+        entropy = torch.zeros_like(logprobs, dtype=torch.float32)
+        return logprobs, values_or_features, entropy
+
     def denoise_velocity_step(
         self,
         *,
@@ -926,11 +1093,14 @@ class Motus(nn.Module):
         language_embeddings=None,
         vlm_inputs=None,
         processed_t5_context: torch.Tensor = None,
+        return_value_features: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """One Motus denoise velocity step shared by eval, train rollout, and actor logprob.
 
         Returns:
             video_velocity, action_velocity, und_tokens
+            If return_value_features=True, also returns pooled action-token features
+            for the RLinf ValueHead.
         """
         B = video_latent.shape[0]
 
@@ -1017,8 +1187,14 @@ class Motus(nn.Module):
             up_len = action_velocity_full.shape[1] - self.action_expert.config.num_registers
             if self.config.training_mode == 'pretrain':
                 action_velocity = action_velocity_full[:, :up_len, :]
+                action_value_tokens = action_tokens[:, :up_len, :]
             else:
                 action_velocity = action_velocity_full[:, 1:up_len, :]
+                action_value_tokens = action_tokens[:, 1:up_len, :]
+
+        if return_value_features:
+            value_features = action_value_tokens.mean(dim=1).float()
+            return video_velocity, action_velocity, und_tokens, value_features
 
         return video_velocity, action_velocity, und_tokens
 
@@ -1035,6 +1211,9 @@ class Motus(nn.Module):
         logprob_mode: str = "flow_ode",
         logprob_sigma: float = 0.5,
         decode_video: bool = True,
+        ignore_first: bool = False,
+        ignore_last: bool = False,
+        return_value_features: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Joint inference for video and action prediction.
 
@@ -1052,9 +1231,22 @@ class Motus(nn.Module):
             state = state.to(self.device).to(self.dtype)
         first_frame = first_frame.to(self.device).to(self.dtype)
 
-        if trace_step is None:
-            trace_step = int(torch.randint(0, num_inference_steps, (1,)).item()) if return_trace else -1
-        trace_step = int(max(-1, min(int(trace_step), num_inference_steps - 1)))
+        if return_trace:
+            if trace_step is None:
+                trace_step = self._select_trace_step(
+                    num_inference_steps,
+                    ignore_first=ignore_first,
+                    ignore_last=ignore_last,
+                )
+            else:
+                trace_step = self._validate_trace_step(
+                    trace_step,
+                    num_inference_steps,
+                    ignore_first=ignore_first,
+                    ignore_last=ignore_last,
+                )
+        else:
+            trace_step = -1
         logprob_mode = str(logprob_mode).lower()
 
         first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
@@ -1080,6 +1272,12 @@ class Motus(nn.Module):
 
         timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
         trace: dict[str, torch.Tensor] = {}
+        video_chains: list[torch.Tensor] = []
+        action_chains: list[torch.Tensor] = []
+        value_features_steps: list[torch.Tensor] = []
+        if return_trace:
+            video_chains.append(video_latent.detach().clone())
+            action_chains.append(action_latent.detach().clone())
 
         for i in range(num_inference_steps):
             t = timesteps[i]
@@ -1092,8 +1290,17 @@ class Motus(nn.Module):
                 trace["action_x_t"] = action_latent.detach().clone()
                 trace["t_scaled"] = t_scaled.detach().clone()
                 trace["dt"] = dt.expand(B).detach().clone()
+                # Match OpenPI's denoise_inds shape convention: non-joint mode
+                # stores the selected index repeated across the denoise dimension,
+                # while actor replay consumes the first column.
+                trace["denoise_inds"] = torch.full(
+                    (B, num_inference_steps),
+                    i,
+                    device=self.device,
+                    dtype=torch.long,
+                )
 
-            video_velocity, action_velocity, _und_tokens = self.denoise_velocity_step(
+            denoise_out = self.denoise_velocity_step(
                 video_latent=video_latent,
                 action_latent=action_latent,
                 state=state,
@@ -1101,7 +1308,13 @@ class Motus(nn.Module):
                 language_embeddings=language_embeddings,
                 vlm_inputs=vlm_inputs,
                 processed_t5_context=processed_t5_context,
+                return_value_features=return_trace and return_value_features,
             )
+            if return_trace and return_value_features:
+                video_velocity, action_velocity, _und_tokens, value_features = denoise_out
+                value_features_steps.append(value_features.detach().clone())
+            else:
+                video_velocity, action_velocity, _und_tokens = denoise_out
 
             video_latent = video_latent + video_velocity * dt
 
@@ -1122,9 +1335,23 @@ class Motus(nn.Module):
             action_latent = action_x_next
             video_latent[:, :, 0:1] = condition_frame_latent
 
+            if return_trace:
+                video_chains.append(video_latent.detach().clone())
+                action_chains.append(action_latent.detach().clone())
+
             if return_trace and i == trace_step:
                 trace["action_x_next"] = action_x_next.detach().clone()
                 trace["old_action_velocity"] = action_velocity.detach().clone()
+
+        if return_trace:
+            trace["video_chains"] = torch.stack(video_chains, dim=1)
+            trace["action_chains"] = torch.stack(action_chains, dim=1)
+            if return_value_features:
+                if len(value_features_steps) != num_inference_steps:
+                    raise RuntimeError(
+                        f"Expected {num_inference_steps} value-feature steps, got {len(value_features_steps)}"
+                    )
+                trace["value_features"] = torch.stack(value_features_steps, dim=1)
 
         predicted_frames = None
         if decode_video:
@@ -1137,7 +1364,17 @@ class Motus(nn.Module):
         predicted_actions = action_latent.float()
 
         if return_trace:
-            required = ["video_latent_t", "action_x_t", "action_x_next", "t_scaled", "dt", "old_action_velocity"]
+            required = [
+                "video_chains",
+                "action_chains",
+                "denoise_inds",
+                "video_latent_t",
+                "action_x_t",
+                "action_x_next",
+                "t_scaled",
+                "dt",
+                "old_action_velocity",
+            ]
             missing = [k for k in required if k not in trace]
             if missing:
                 raise RuntimeError(f"Motus inference trace missing keys: {missing}")

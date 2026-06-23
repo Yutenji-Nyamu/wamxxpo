@@ -45,3 +45,11 @@ motus:
   logprob_mode: "flow_sde"
   logprob_sigma: 0.5
   collect_denoise_step: "random"
+  # OpenPI-style denoise-index controls. Defaults match OpenPI's default
+  # behavior; keep the knobs explicit so random trace selection is not hidden.
+  ignore_first: False
+  ignore_last: False
+
+  # PPO critic, aligned with OpenPI's action-suffix value path.
+  detach_critic_input: True
+  value_feature: "action_tokens"

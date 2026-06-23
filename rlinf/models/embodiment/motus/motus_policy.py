@@ -13,6 +13,7 @@ from PIL import Image
 from torch import nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.modules.value_head import ValueHead
 
 
 def _as_bool(x, default: bool = False) -> bool:
@@ -78,6 +79,16 @@ class MotusPolicy(nn.Module, BasePolicy):
         self.logprob_mode = str(motus_cfg.get("logprob_mode", "transition_velocity")).lower()
         self.logprob_sigma = float(motus_cfg.get("logprob_sigma", 1.0))
         self.collect_denoise_step = str(motus_cfg.get("collect_denoise_step", "random")).lower()
+        self.ignore_first = _as_bool(motus_cfg.get("ignore_first", False), default=False)
+        self.ignore_last = _as_bool(motus_cfg.get("ignore_last", False), default=False)
+        self.add_value_head = _as_bool(cfg.get("add_value_head", False), default=False)
+        self.detach_critic_input = _as_bool(motus_cfg.get("detach_critic_input", True), default=True)
+        self.value_feature = str(motus_cfg.get("value_feature", "action_tokens")).lower()
+        if self.value_feature != "action_tokens":
+            raise ValueError(
+                f"Unsupported Motus value_feature={self.value_feature!r}. "
+                "OpenPI-aligned PPO currently uses action_tokens."
+            )
 
         if not self.policy_path.exists():
             raise FileNotFoundError(f"Motus policy_path not found: {self.policy_path}")
@@ -111,6 +122,15 @@ class MotusPolicy(nn.Module, BasePolicy):
 
         # Expose official Motus nn.Module as a submodule so RLinf Actor/FSDP/optimizer/checkpoint can see it.
         self.model = self._policy.model
+        if self.add_value_head:
+            value_input_dim = int(getattr(self.model.config, "action_expert_dim", 1024))
+            self.value_head = ValueHead(
+                input_dim=value_input_dim,
+                hidden_sizes=(512, 256, 128),
+                output_dim=1,
+                activation="relu",
+                bias_last=True,
+            ).to(self.device)
         self._configure_trainable_parameters()
 
         # Make YAML-level inference-step override effective. The official wrapper
@@ -263,58 +283,115 @@ class MotusPolicy(nn.Module, BasePolicy):
         """Actor update forward for RLinf PPO/GRPO.
 
         Recompute current-policy logprobs for the denoise transition captured
-        during rollout. This is the Motus analogue of OpenPI's πRL logprob.
+        during rollout. The replay object mirrors OpenPI's chain-based flow RL
+        path: action/video chains plus denoise indices define the stochastic
+        transition whose logprob is recomputed under the current actor.
         """
         if forward_inputs is None:
             raise ValueError("Motus default_forward requires forward_inputs.")
+        if "motus_action_chains" not in forward_inputs or "motus_video_chains" not in forward_inputs:
+            raise ValueError(
+                "Motus default_forward requires OpenPI-style chain replay fields "
+                "`motus_action_chains` and `motus_video_chains`. Regenerate rollouts "
+                "with the current Motus adapter instead of using selected-transition-only data."
+            )
+        if "motus_denoise_inds" not in forward_inputs:
+            raise ValueError("Motus default_forward requires `motus_denoise_inds`.")
+        if not hasattr(self.model, "get_log_prob_value"):
+            raise RuntimeError(
+                "Motus model must implement get_log_prob_value() for OpenPI-style "
+                "chain replay. Update third_party/Motus/models/motus.py."
+            )
 
         device = next(self.model.parameters()).device
-
-        video_latent_t = forward_inputs["motus_video_latent_t"].to(device=device, dtype=self.model.dtype)
-        action_x_t = forward_inputs["motus_action_x_t"].to(device=device, dtype=self.model.dtype)
-        action_x_next = forward_inputs["motus_action_x_next"].to(device=device, dtype=self.model.dtype)
+        action_chains = forward_inputs["motus_action_chains"].to(
+            device=device,
+            dtype=self.model.dtype,
+        )
+        video_chains = forward_inputs["motus_video_chains"].to(
+            device=device,
+            dtype=self.model.dtype,
+        )
+        denoise_inds = forward_inputs["motus_denoise_inds"].to(
+            device=device,
+            dtype=torch.long,
+        )
         state = forward_inputs["motus_state"].to(device=device, dtype=self.model.dtype)
-        t_scaled = forward_inputs["motus_t_scaled"].to(device=device, dtype=self.model.dtype)
-        dt = forward_inputs["motus_dt"].to(device=device, dtype=self.model.dtype)
-
         language_embeddings = forward_inputs["motus_language_embeddings"].to(
             device=device,
             dtype=self.model.dtype,
         )
         vlm_inputs = self._vlm_inputs_from_forward_inputs(forward_inputs, device=device)
 
-        # Current actor velocity at the rollout transition.
-        _, action_velocity = self._motus_velocity_step(
-            video_latent=video_latent_t,
-            action_latent=action_x_t,
+        compute_values = bool(kwargs.get("compute_values", False))
+        if compute_values and not self.add_value_head:
+            raise NotImplementedError(
+                "Motus PPO requires actor.model.add_value_head=True. "
+                "GRPO/actor-only configs may keep add_value_head=False."
+            )
+
+        logprobs, value_features, entropy = self.model.get_log_prob_value(
+            video_chains=video_chains,
+            action_chains=action_chains,
+            denoise_inds=denoise_inds,
             state=state,
-            t_scaled=t_scaled,
             language_embeddings=language_embeddings,
             vlm_inputs=vlm_inputs,
+            logprob_mode=self.logprob_mode,
+            logprob_sigma=self.logprob_sigma,
+            num_action_chunks=self.num_action_chunks,
+            action_dim=self.action_dim,
+            compute_values=compute_values,
+            return_value_features=compute_values,
         )
-
-        logprobs = self._transition_logprobs(
-            action_velocity=action_velocity,
-            action_x_t=action_x_t,
-            action_x_next=action_x_next,
-            t_scaled=t_scaled,
-            dt=dt,
-        )
+        values = self._compute_values_from_features(value_features) if compute_values else None
 
         out = {
             "logprobs": logprobs.float(),
-            "values": None,
+            "values": values,
         }
 
         if kwargs.get("compute_entropy", False):
-            # No analytic entropy yet. Shape [B,1] is compatible with RLinf entropy reshaping.
-            out["entropy"] = torch.zeros(
-                (logprobs.shape[0], 1),
-                device=logprobs.device,
-                dtype=torch.float32,
-            )
+            if entropy is None:
+                entropy = torch.zeros_like(logprobs, dtype=torch.float32)
+            out["entropy"] = entropy.float()
 
         return out
+
+    def _compute_values_from_features(self, value_features: torch.Tensor | None) -> torch.Tensor:
+        """Compute PPO critic values from Motus action-token features.
+
+        OpenPI computes critic values from action suffix features. Motus mirrors
+        that by pooling action-expert tokens from the replayed denoise step; the
+        third-party Motus model returns those pooled features, while the RLinf
+        adapter owns the ValueHead so RLinf/FSDP/optimizer can see it directly.
+        """
+        if not self.add_value_head or not hasattr(self, "value_head"):
+            raise NotImplementedError(
+                "Motus value head is not initialized. Set actor.model.add_value_head=True for PPO."
+            )
+        if value_features is None:
+            raise RuntimeError("Motus get_log_prob_value did not return value_features.")
+
+        value_param = next(self.value_head.parameters())
+        value_features = value_features.to(
+            device=value_param.device,
+            dtype=value_param.dtype,
+        )
+        if self.detach_critic_input:
+            value_features = value_features.detach()
+
+        if value_features.dim() == 3:
+            # OpenPI rollout computes a value for each denoise step and averages
+            # values over the denoise dimension for prev_values.
+            bsz, n_steps, hidden = value_features.shape
+            flat_values = self.value_head(value_features.reshape(bsz * n_steps, hidden))
+            return flat_values.reshape(bsz, n_steps, -1).mean(dim=1)[:, :1].float()
+        if value_features.dim() != 2:
+            raise ValueError(
+                f"Motus value_features must be [B,H] or [B,S,H], got {tuple(value_features.shape)}"
+            )
+        return self.value_head(value_features).reshape(value_features.shape[0], -1)[:, :1].float()
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -363,15 +440,12 @@ class MotusPolicy(nn.Module, BasePolicy):
                 "or reduce env count per rollout worker."
             )
 
-        # Training needs prev_logprobs + tensor-only forward_inputs, so always use
-        # the vectorized path even for B=1.
-        if mode == "train":
-            return self._predict_action_batch_vectorized(env_obs, batch_size, mode=mode)
+        if mode not in {"train", "eval"}:
+            raise ValueError(f"Motus predict_action_batch mode must be 'train' or 'eval', got {mode!r}")
 
-        if self.batch_inference and batch_size > 1:
-            return self._predict_action_batch_vectorized(env_obs, batch_size, mode=mode)
-
-        return self._predict_action_batch_loop(env_obs, batch_size)
+        # Match OpenPI's train/eval structure: both modes use the same vectorized
+        # model inference path; train only asks that path to return replay chains.
+        return self._predict_action_batch_vectorized(env_obs, batch_size, mode=mode)
 
     def _predict_action_batch_loop(
         self, env_obs: dict[str, Any], batch_size: int
@@ -432,11 +506,14 @@ class MotusPolicy(nn.Module, BasePolicy):
             )
 
         self._ensure_motus_grid_batch_size(batch_size)
+        language_embeddings = self._stack_t5_embeddings(t5_list).to(self.device)
+        vlm_inputs_batched = self._collate_vlm_inputs(vlm_inputs_list, device=self.device)
 
         print(
             f"[RLinf-Motus] vectorized batch inference: "
             f"B={batch_size}, first_frame={tuple(first_frame.shape)}, "
-            f"state={tuple(state.shape)}, t5={len(t5_list)}, vlm={len(vlm_inputs_list)}, "
+            f"state={tuple(state.shape)}, t5={tuple(language_embeddings.shape)}, "
+            f"vlm_input_ids={tuple(vlm_inputs_batched['input_ids'].shape)}, "
             f"decode_video={self.decode_video}",
             flush=True,
         )
@@ -445,21 +522,17 @@ class MotusPolicy(nn.Module, BasePolicy):
             "first_frame": first_frame,
             "state": state,
             "num_inference_steps": self.num_inference_timesteps,
-            "language_embeddings": t5_list,
-            "vlm_inputs": vlm_inputs_list,
+            "language_embeddings": language_embeddings,
+            "vlm_inputs": vlm_inputs_batched,
         }
 
         sig = inspect.signature(self._policy.model.inference_step)
-        if "decode_video" in sig.parameters:
-            call_kwargs["decode_video"] = self.decode_video
-        elif self.decode_video is False and not self._warned_decode_video_unsupported:
-            print(
-                "[RLinf-Motus] underlying Motus.inference_step does not support "
-                "decode_video; calling without it, so predicted video may still be decoded "
-                "inside clean Motus if its implementation always decodes.",
-                flush=True,
+        if "decode_video" not in sig.parameters:
+            raise RuntimeError(
+                "Motus eval path requires inference_step(decode_video=...) so train/eval "
+                "share the same controllable model path. Update third_party/Motus/models/motus.py."
             )
-            self._warned_decode_video_unsupported = True
+        call_kwargs["decode_video"] = self.decode_video
 
         out = self._policy.model.inference_step(**call_kwargs)
 
@@ -531,51 +604,91 @@ class MotusPolicy(nn.Module, BasePolicy):
         trace_step = self._select_trace_step(self.num_inference_timesteps)
 
         sig = inspect.signature(self._policy.model.inference_step)
-        if "return_trace" in sig.parameters:
-            out = self._policy.model.inference_step(
-                first_frame=first_frame,
-                state=state,
-                num_inference_steps=self.num_inference_timesteps,
-                language_embeddings=language_embeddings,
-                vlm_inputs=vlm_inputs_batched,
-                return_trace=True,
-                trace_step=trace_step,
-                logprob_mode=self.logprob_mode,
-                logprob_sigma=self.logprob_sigma,
-                decode_video=False,
+        required_params = {"return_trace", "trace_step", "logprob_mode", "logprob_sigma"}
+        missing_params = required_params.difference(sig.parameters)
+        if missing_params:
+            raise RuntimeError(
+                "Motus model inference_step is missing OpenPI-style trace parameters: "
+                f"{sorted(missing_params)}. Update third_party/Motus/models/motus.py; "
+                "selected-transition-only or adapter-local fallback is intentionally disabled."
             )
-            if not isinstance(out, tuple) or len(out) < 3:
+
+        call_kwargs = dict(
+            first_frame=first_frame,
+            state=state,
+            num_inference_steps=self.num_inference_timesteps,
+            language_embeddings=language_embeddings,
+            vlm_inputs=vlm_inputs_batched,
+            return_trace=True,
+            trace_step=trace_step,
+            logprob_mode=self.logprob_mode,
+            logprob_sigma=self.logprob_sigma,
+            decode_video=False,
+        )
+        if "ignore_first" in sig.parameters:
+            call_kwargs["ignore_first"] = self.ignore_first
+        if "ignore_last" in sig.parameters:
+            call_kwargs["ignore_last"] = self.ignore_last
+        if self.add_value_head:
+            if "return_value_features" not in sig.parameters:
                 raise RuntimeError(
-                    "Motus inference_step(return_trace=True) must return "
-                    "(predicted_frames, predicted_actions, trace)."
+                    "Motus PPO requires inference_step(return_value_features=...). "
+                    "Update third_party/Motus/models/motus.py."
                 )
-            _, predicted_actions, trace = out[:3]
-        else:
-            print(
-                "[RLinf-Motus] WARNING: Motus model has no "
-                "inference_step(return_trace=True); falling back to adapter-local "
-                "denoise loop. Train/eval denoise loops are not fully shared.",
-                flush=True,
+            call_kwargs["return_value_features"] = True
+
+        out = self._policy.model.inference_step(**call_kwargs)
+        if not isinstance(out, tuple) or len(out) < 3:
+            raise RuntimeError(
+                "Motus inference_step(return_trace=True) must return "
+                "(predicted_frames, predicted_actions, trace)."
             )
-            predicted_actions, trace = self._motus_sample_actions_with_transition(
-                first_frame=first_frame,
-                state=state,
-                language_embeddings=language_embeddings,
-                vlm_inputs=vlm_inputs_batched,
-                num_inference_steps=self.num_inference_timesteps,
-                trace_step=trace_step,
+        _, predicted_actions, trace = out[:3]
+
+        required_trace_keys = {
+            "video_chains",
+            "action_chains",
+            "denoise_inds",
+            "video_latent_t",
+            "action_x_t",
+            "action_x_next",
+            "t_scaled",
+            "dt",
+            "old_action_velocity",
+        }
+        if self.add_value_head:
+            required_trace_keys.add("value_features")
+        missing_trace_keys = required_trace_keys.difference(trace)
+        if missing_trace_keys:
+            raise RuntimeError(
+                "Motus inference trace missing OpenPI-style replay keys: "
+                f"{sorted(missing_trace_keys)}"
             )
 
         actions = predicted_actions[:, : self.num_action_chunks, : self.action_dim]
         action_tensor = actions.detach().float().cpu().contiguous()
 
-        prev_logprobs = self._transition_logprobs(
-            action_velocity=trace["old_action_velocity"],
-            action_x_t=trace["action_x_t"],
-            action_x_next=trace["action_x_next"],
-            t_scaled=trace["t_scaled"],
-            dt=trace["dt"],
-        ).detach().float().cpu().contiguous()
+        compute_values = self.add_value_head
+        prev_logprobs, value_features, _entropy = self.model.get_log_prob_value(
+            video_chains=trace["video_chains"],
+            action_chains=trace["action_chains"],
+            denoise_inds=trace["denoise_inds"],
+            state=state,
+            language_embeddings=language_embeddings,
+            vlm_inputs=vlm_inputs_batched,
+            logprob_mode=self.logprob_mode,
+            logprob_sigma=self.logprob_sigma,
+            num_action_chunks=self.num_action_chunks,
+            action_dim=self.action_dim,
+            compute_values=compute_values,
+            return_value_features=compute_values,
+        )
+        prev_logprobs = prev_logprobs.detach().float().cpu().contiguous()
+        prev_values = None
+        if compute_values:
+            # Match OpenPI rollout behavior: compute a value for each denoise
+            # step during sampling, then average values over the denoise dimension.
+            prev_values = self._compute_values_from_features(trace["value_features"]).detach().float().cpu().contiguous()
 
         forward_inputs = {
             # Required by EnvWorker when storing executed actions.
@@ -593,6 +706,19 @@ class MotusPolicy(nn.Module, BasePolicy):
             "motus_vlm_pixel_values": vlm_inputs_batched["_pixel_values_batched"].detach().cpu().contiguous(),
             "motus_vlm_image_grid_thw": vlm_inputs_batched["image_grid_thw"].detach().cpu().contiguous(),
 
+            # OpenPI-style denoise replay. Store full action/video chains and
+            # the selected denoise index; actor forward replays the same transition.
+            "motus_action_chains": trace["action_chains"].detach().float().cpu().contiguous(),
+            "motus_video_chains": trace["video_chains"].detach().float().cpu().contiguous(),
+            "motus_denoise_inds": trace["denoise_inds"].detach().cpu().contiguous(),
+
+            # OpenPI-style PPO rollout values use per-denoise-step value features.
+            **({
+                "motus_value_features": trace["value_features"].detach().float().cpu().contiguous(),
+            } if self.add_value_head else {}),
+
+            # Compatibility/debug selected-transition fields. Actor replay is based
+            # on chains + denoise_inds, not these selected-only tensors.
             "motus_video_latent_t": trace["video_latent_t"].detach().float().cpu().contiguous(),
             "motus_action_x_t": trace["action_x_t"].detach().float().cpu().contiguous(),
             "motus_action_x_next": trace["action_x_next"].detach().float().cpu().contiguous(),
@@ -603,7 +729,7 @@ class MotusPolicy(nn.Module, BasePolicy):
 
         return action_tensor, {
             "prev_logprobs": prev_logprobs,
-            "prev_values": None,
+            "prev_values": prev_values,
             "forward_inputs": forward_inputs,
         }
 
@@ -730,116 +856,39 @@ class MotusPolicy(nn.Module, BasePolicy):
         }
 
     def _select_trace_step(self, num_inference_steps: int) -> int:
-        if self.collect_denoise_step == "random":
-            return int(torch.randint(0, num_inference_steps, (1,)).item())
-        trace_step = int(self.collect_denoise_step)
-        return max(0, min(trace_step, num_inference_steps - 1))
-
-    def _motus_sample_actions_with_transition(
-        self,
-        *,
-        first_frame: torch.Tensor,
-        state: torch.Tensor,
-        language_embeddings: torch.Tensor,
-        vlm_inputs: dict[str, torch.Tensor],
-        num_inference_steps: int,
-        trace_step: int | None = None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Run Motus denoising and capture one action transition for πRL."""
-        model = self.model
-        B = first_frame.shape[0]
-        self._ensure_motus_grid_batch_size(B)
-
-        first_frame = first_frame.to(device=self.device, dtype=model.dtype)
-        state = state.to(device=self.device, dtype=model.dtype)
-        language_embeddings = language_embeddings.to(device=self.device, dtype=model.dtype)
-
-        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
-
-        # VAE is frozen; keep condition latent detached.
-        with torch.no_grad():
-            condition_frame_latent = model.video_model.encode_video(first_frame_norm.to(model.dtype))
-
-        B, c_latent, _, h_latent, w_latent = condition_frame_latent.shape
-        num_total_latent_frames = 1 + model.config.num_video_frames // 4
-
-        video_latent = torch.randn(
-            (B, c_latent, num_total_latent_frames, h_latent, w_latent),
-            device=self.device,
-            dtype=model.dtype,
-        )
-        video_latent[:, :, 0:1] = condition_frame_latent
-
-        action_latent = torch.randn(
-            (B, model.config.action_chunk_size, model.config.action_dim),
-            device=self.device,
-            dtype=model.dtype,
-        )
-
-        if trace_step is None:
-            trace_step = self._select_trace_step(num_inference_steps)
-
-        timesteps = torch.linspace(
-            1.0,
-            0.0,
-            num_inference_steps + 1,
-            device=self.device,
-            dtype=model.dtype,
-        )
-
-        trace: dict[str, torch.Tensor] = {}
-
-        for i in range(num_inference_steps):
-            t = timesteps[i]
-            t_next = timesteps[i + 1]
-            dt = t_next - t
-            t_scaled = (t * 1000).expand(B).to(model.dtype)
-
-            if i == trace_step:
-                trace["video_latent_t"] = video_latent.detach().clone()
-                trace["action_x_t"] = action_latent.detach().clone()
-                trace["t_scaled"] = t_scaled.detach().clone()
-                trace["dt"] = dt.expand(B).detach().clone()
-
-            video_velocity, action_velocity = self._motus_velocity_step(
-                video_latent=video_latent,
-                action_latent=action_latent,
-                state=state,
-                t_scaled=t_scaled,
-                language_embeddings=language_embeddings,
-                vlm_inputs=vlm_inputs,
+        lo = 1 if self.ignore_first else 0
+        hi = num_inference_steps - 1 - (1 if self.ignore_last else 0)
+        if hi < lo:
+            raise ValueError(
+                f"Invalid Motus denoise index range [{lo}, {hi}] for "
+                f"num_inference_steps={num_inference_steps}, "
+                f"ignore_first={self.ignore_first}, ignore_last={self.ignore_last}."
             )
 
-            video_latent = video_latent + video_velocity * dt
+        if self.collect_denoise_step == "random":
+            return int(torch.randint(lo, hi + 1, (1,)).item())
 
-            mean_action_next = action_latent + action_velocity * dt
+        trace_step = int(self.collect_denoise_step)
+        if not (lo <= trace_step <= hi):
+            raise ValueError(
+                f"Motus collect_denoise_step={trace_step} is outside the allowed "
+                f"range [{lo}, {hi}] after ignore_first/ignore_last filtering."
+            )
+        return trace_step
 
-            if i == trace_step and self.logprob_mode in {"flow_sde", "transition_sde"}:
-                mean_sde, std_sde = self._flow_sde_mean_std(
-                    action_x_t=action_latent,
-                    action_velocity=action_velocity,
-                    t_scaled=t_scaled,
-                    dt=dt.expand(B),
-                )
-                eps = torch.randn_like(mean_sde)
-                action_x_next = mean_sde + std_sde * eps
-                trace["transition_std"] = std_sde.detach().clone()
-            else:
-                action_x_next = mean_action_next
+    def _motus_sample_actions_with_transition(self, *args, **kwargs):
+        """Disabled adapter-local denoise loop.
 
-            action_latent = action_x_next
-            video_latent[:, :, 0:1] = condition_frame_latent
-
-            if i == trace_step:
-                trace["action_x_next"] = action_x_next.detach().clone()
-                trace["old_action_velocity"] = action_velocity.detach().clone()
-
-        predicted_actions = action_latent.float()
-
-        if not trace:
-            raise RuntimeError("Motus transition trace was not captured.")
-
-        return predicted_actions, trace
+        Motus RL rollout must use third_party.Motus.inference_step(return_trace=True)
+        so train rollout, old logprob, and actor replay share the same model-side
+        denoise implementation. Falling back here would silently reintroduce the
+        selected-transition-only shrink path.
+        """
+        raise RuntimeError(
+            "Adapter-local Motus denoise fallback is disabled. Update "
+            "third_party/Motus/models/motus.py to provide inference_step(return_trace=True) "
+            "with action/video chains and denoise_inds."
+        )
 
     def _motus_velocity_step(
         self,
@@ -851,103 +900,21 @@ class MotusPolicy(nn.Module, BasePolicy):
         language_embeddings: torch.Tensor,
         vlm_inputs: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One Motus denoise step: returns video_velocity and action_velocity."""
+        """Strict wrapper for the shared Motus model-side denoise step."""
         model = self.model
-        if hasattr(model, "denoise_velocity_step"):
-            video_velocity, action_velocity, _ = model.denoise_velocity_step(
-                video_latent=video_latent,
-                action_latent=action_latent,
-                state=state,
-                t_scaled=t_scaled,
-                language_embeddings=language_embeddings,
-                vlm_inputs=vlm_inputs,
+        if not hasattr(model, "denoise_velocity_step"):
+            raise RuntimeError(
+                "Motus model must implement denoise_velocity_step(); adapter-local "
+                "denoise reconstruction is disabled to keep rollout and actor replay aligned."
             )
-            return video_velocity, action_velocity
-
-        B = action_latent.shape[0]
-
-        video_tokens = model.video_module.prepare_input(video_latent.to(model.dtype))
-
-        state_tokens = state.unsqueeze(1).to(model.dtype)
-        if model.action_expert.config.num_registers > 0 and model.action_expert.registers is not None:
-            registers = model.action_expert.registers.expand(B, -1, -1)
-        else:
-            registers = None
-
-        action_tokens = model.action_expert.input_encoder(
-            state_tokens,
-            action_latent.to(model.dtype),
-            registers,
+        video_velocity, action_velocity, _ = model.denoise_velocity_step(
+            video_latent=video_latent,
+            action_latent=action_latent,
+            state=state,
+            t_scaled=t_scaled,
+            language_embeddings=language_embeddings,
+            vlm_inputs=vlm_inputs,
         )
-
-        # Official Motus recomputes understanding tokens in the denoising loop.
-        und_tokens = model.und_module.extract_und_features(vlm_inputs)
-        processed_t5_context = model.video_module.preprocess_t5_embeddings(language_embeddings)
-
-        with torch.autocast(device_type="cuda", dtype=model.video_model.precision):
-            video_head_time_emb, video_adaln_params = model.video_module.get_time_embedding(
-                t_scaled,
-                video_tokens.shape[1],
-            )
-            action_head_time_emb, action_adaln_params = model.action_module.get_time_embedding(
-                t_scaled,
-                action_tokens.shape[1],
-            )
-
-            for layer_idx in range(model.config.num_layers):
-                video_adaln_modulation = model.video_module.compute_adaln_modulation(
-                    video_adaln_params,
-                    layer_idx,
-                )
-                action_adaln_modulation = model.action_module.compute_adaln_modulation(
-                    action_adaln_params,
-                    layer_idx,
-                )
-
-                video_tokens, action_tokens, und_tokens = model.video_module.process_joint_attention(
-                    video_tokens,
-                    action_tokens,
-                    video_adaln_modulation,
-                    action_adaln_modulation,
-                    layer_idx,
-                    model.action_expert.blocks[layer_idx],
-                    und_tokens,
-                    model.und_expert.blocks[layer_idx],
-                )
-
-                video_tokens = model.video_module.process_cross_attention(
-                    video_tokens,
-                    video_adaln_params,
-                    layer_idx,
-                    processed_t5_context,
-                )
-
-                video_tokens = model.video_module.process_ffn(
-                    video_tokens,
-                    video_adaln_modulation,
-                    layer_idx,
-                )
-                action_tokens = model.action_module.process_ffn(
-                    action_tokens,
-                    action_adaln_modulation,
-                    layer_idx,
-                )
-                und_tokens = model.und_module.process_ffn(und_tokens, layer_idx)
-
-            video_velocity = model.video_module.apply_output_head(
-                video_tokens,
-                video_head_time_emb,
-            )
-
-            action_pred_full = model.action_expert.decoder(
-                action_tokens,
-                action_head_time_emb,
-            )
-
-            n_reg = int(model.action_expert.config.num_registers)
-            end = -n_reg if n_reg > 0 else None
-            action_velocity = action_pred_full[:, 1:end, :]
-
         return video_velocity, action_velocity
 
     def _flow_sde_mean_std(
@@ -976,32 +943,10 @@ class MotusPolicy(nn.Module, BasePolicy):
                 noise_level=float(self.logprob_sigma),
             )
 
-        t = (t_scaled.float() / 1000.0).clamp(1e-6, 1.0)
-        delta = (-dt.float()).clamp_min(1e-8)
-
-        while t.dim() < action_x_t.dim():
-            t = t.unsqueeze(-1)
-        while delta.dim() < action_x_t.dim():
-            delta = delta.unsqueeze(-1)
-
-        x0_pred = action_x_t.float() - action_velocity.float() * t
-        x1_pred = action_x_t.float() + action_velocity.float() * (1.0 - t)
-
-        noise_level = float(self.logprob_sigma)
-        # OpenPI uses denom_timesteps = where(t == 1, next_t, t); this avoids
-        # division by zero at t=1. For the first step use t_next = t - delta.
-        t_next = (t - delta).clamp_min(1e-6)
-        denom = torch.where(t >= 1.0 - 1e-6, t_next, t).clamp_min(1e-6)
-        sigma_ratio = t / (1.0 - denom).clamp_min(1e-6)
-        sigma_i = noise_level * torch.sqrt(sigma_ratio)
-
-        x0_weight = 1.0 - (t - delta)
-        x1_weight = (t - delta) - sigma_i.pow(2) * delta / (2.0 * t.clamp_min(1e-6))
-        mean = x0_pred * x0_weight + x1_pred * x1_weight
-        std = torch.sqrt(delta) * sigma_i
-        std = std.clamp_min(1e-6)
-
-        return mean.to(action_x_t.dtype), std.to(action_x_t.dtype)
+        raise RuntimeError(
+            "Motus model must implement flow_sde_mean_std(); adapter-local "
+            "flow-SDE formula fallback is disabled to keep rollout and actor replay aligned."
+        )
 
     def _transition_velocity_logprobs(
         self,

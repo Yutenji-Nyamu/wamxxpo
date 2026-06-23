@@ -198,6 +198,8 @@ actor:
       logprob_mode: "flow_sde"
       logprob_sigma: 0.5
       collect_denoise_step: "random"
+      ignore_first: False
+      ignore_last: False
 
   optim:
     lr: 1.0e-6
@@ -224,9 +226,9 @@ reward:
 critic:
   use_critic_model: False
 
-# Motus loads the same checkpoint in actor and rollout.
-# Avoid full 8B-model init sync; later patch sync will sync trainable action_expert deltas.
+# Match OpenPI's default patch-sync behavior: initialize rollout weights from actor
+# before sending later trainable-parameter patches.
 weight_syncer:
   patch:
     init_sync:
-      enabled: False
+      enabled: True
