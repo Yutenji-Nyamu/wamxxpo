@@ -43,8 +43,8 @@ env:
     auto_reset: True
     ignore_terminations: True
 
-    max_episode_steps: 400
-    max_steps_per_rollout_epoch: 400
+    max_episode_steps: 192
+    max_steps_per_rollout_epoch: 192
 
     reward_coef: 1.0
     group_size: 1
@@ -61,7 +61,7 @@ env:
 
     center_crop: False
     task_config:
-      step_lim: 400
+      step_lim: 192
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
@@ -82,3 +82,7 @@ rollout:
   pipeline_stage_num: 1
   model:
     add_value_head: True
+    motus:
+      value_after_vlm: True
+      value_feature: "vlm_tokens"
+      value_vlm_mode: "mean_token"

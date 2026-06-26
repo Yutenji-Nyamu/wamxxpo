@@ -204,7 +204,9 @@ actor:
       ignore_last: False
 
       detach_critic_input: True
-      value_feature: "action_tokens"
+      value_after_vlm: True
+      value_feature: "vlm_tokens"
+      value_vlm_mode: "mean_token"
 
   optim:
     lr: 5.6e-6

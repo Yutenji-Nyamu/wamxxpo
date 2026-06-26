@@ -289,20 +289,25 @@ class UndModule(nn.Module):
         # Understanding Expert reference
         self.und_expert = und_expert
         
-    def extract_und_features(
+    def extract_vlm_last_hidden(
         self,
-        vlm_inputs
-    ) -> torch.Tensor:
-        """Extract understanding features from VLM last layer."""
+        vlm_inputs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract raw Qwen3-VL last-layer hidden states for pi0.5-style value.
+
+        Returns:
+            last_layer_features: [B, seq_len, 2048]
+            attention_mask: [B, seq_len], where nonzero tokens are valid.
+        """
         if isinstance(vlm_inputs, list):
             B = len(vlm_inputs)
         else:
             B = vlm_inputs['input_ids'].shape[0]
 
-        # Returns: inputs_embeds, attention_mask, visual_pos_masks, deepstack_image_embeds, position_ids
+        # Returns: inputs_embeds, attention_mask, visual_pos_masks,
+        # deepstack_image_embeds, position_ids.
         inputs_embeds, attention_mask, visual_pos_masks, deepstack_image_embeds, position_ids = self._process_vlm_inputs_to_tokens(vlm_inputs, B)
 
-        # Forward through VLM with proper attention_mask and DeepStack features
         vlm_kwargs = {
             'inputs_embeds': inputs_embeds,
             'attention_mask': attention_mask,
@@ -311,10 +316,10 @@ class UndModule(nn.Module):
             'use_cache': False,
             'output_attentions': False,
             'output_hidden_states': True,
-            'return_dict': True
+            'return_dict': True,
         }
 
-        # Add DeepStack parameters for Qwen3-VL
+        # Add DeepStack parameters for Qwen3-VL.
         if visual_pos_masks is not None:
             vlm_kwargs['visual_pos_masks'] = visual_pos_masks
         if deepstack_image_embeds is not None:
@@ -323,14 +328,91 @@ class UndModule(nn.Module):
         with torch.no_grad():
             vlm_output = self.vlm_model.model.language_model(**vlm_kwargs)
 
-        # Extract last layer features directly
-        last_layer_features = vlm_output.hidden_states[-1]  # [B, seq_len, vlm_dim]
+        last_layer_features = vlm_output.hidden_states[-1]  # [B, seq_len, 2048]
+        return last_layer_features, attention_mask
+
+    @staticmethod
+    def pool_vlm_value_features(
+        last_layer_features: torch.Tensor,
+        attention_mask: torch.Tensor,
+        mode: str = "mean_token",
+    ) -> torch.Tensor:
+        """Pool raw VLM tokens into one value feature per sample.
+
+        OpenPI pi0.5 uses prefix masks over a fixed token layout. Motus Qwen3-VL
+        inputs are padded to a fixed length, so attention_mask is the equivalent
+        validity mask.
+        """
+        mode = str(mode).lower()
+        if attention_mask is None:
+            valid = torch.ones(
+                last_layer_features.shape[:2],
+                device=last_layer_features.device,
+                dtype=torch.bool,
+            )
+        else:
+            valid = attention_mask.to(device=last_layer_features.device).bool()
+
+        if last_layer_features.dim() != 3:
+            raise ValueError(
+                f"VLM value features require [B,L,H] hidden states, got {tuple(last_layer_features.shape)}"
+            )
+        if valid.shape[:2] != last_layer_features.shape[:2]:
+            raise ValueError(
+                f"attention_mask shape {tuple(valid.shape)} does not match hidden shape {tuple(last_layer_features.shape)}"
+            )
+
+        if mode == "mean_token":
+            weights = valid.to(dtype=last_layer_features.dtype).unsqueeze(-1)
+            denom = weights.sum(dim=1).clamp_min(1.0)
+            pooled = (last_layer_features * weights).sum(dim=1) / denom
+            return pooled.float()
+
+        if mode == "first_token":
+            # Use the first valid token rather than hard-coding index 0. This is
+            # equivalent for right-padded Qwen inputs but safer for any future
+            # processor that might change padding side.
+            first_idx = valid.float().argmax(dim=1).long()
+            batch_idx = torch.arange(last_layer_features.shape[0], device=last_layer_features.device)
+            return last_layer_features[batch_idx, first_idx].float()
+
+        if mode == "last_token":
+            lengths = valid.long().sum(dim=1).clamp_min(1)
+            last_idx = lengths - 1
+            batch_idx = torch.arange(last_layer_features.shape[0], device=last_layer_features.device)
+            return last_layer_features[batch_idx, last_idx].float()
+
+        raise ValueError(
+            f"Unsupported value_vlm_mode={mode!r}. Supported values: mean_token, first_token, last_token."
+        )
+
+    def extract_und_features(
+        self,
+        vlm_inputs,
+        *,
+        return_vlm_value_features: bool = False,
+        value_vlm_mode: str = "mean_token",
+    ):
+        """Extract understanding features from VLM last layer.
+
+        If return_vlm_value_features=True, also return pooled raw VLM hidden
+        features [B,2048] for OpenPI pi0.5-style value_after_vlm critic.
+        """
+        last_layer_features, attention_mask = self.extract_vlm_last_hidden(vlm_inputs)
 
         # [B, seq_len, vlm_dim] -> [B, seq_len, und_dim]
         adapted_features = self.und_expert.vlm_adapter(last_layer_features)
 
+        if return_vlm_value_features:
+            value_features = self.pool_vlm_value_features(
+                last_layer_features,
+                attention_mask,
+                mode=value_vlm_mode,
+            )
+            return adapted_features, value_features
+
         return adapted_features
-        
+
     def _process_vlm_inputs_to_tokens(self, vlm_inputs, B: int) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[list], torch.Tensor]:
         """Convert VLM inputs to tokens.
 
@@ -967,6 +1049,8 @@ class Motus(nn.Module):
         action_dim: Optional[int] = None,
         compute_values: bool = False,
         return_value_features: bool = False,
+        value_feature: str = "action_tokens",
+        value_vlm_mode: str = "mean_token",
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """Replay Motus denoise chains and recompute selected transition logprob.
 
@@ -1025,6 +1109,9 @@ class Motus(nn.Module):
             else:
                 language_embeddings = language_embeddings.to(self.device).to(self.dtype)
 
+        value_feature = str(value_feature).lower()
+        value_vlm_mode = str(value_vlm_mode).lower()
+
         denoise_out = self.denoise_velocity_step(
             video_latent=video_latent_t,
             action_latent=action_x_t,
@@ -1033,6 +1120,8 @@ class Motus(nn.Module):
             language_embeddings=language_embeddings,
             vlm_inputs=vlm_inputs,
             return_value_features=compute_values or return_value_features,
+            value_feature=value_feature,
+            value_vlm_mode=value_vlm_mode,
         )
         if compute_values or return_value_features:
             _video_velocity, action_velocity, _und_tokens, value_features = denoise_out
@@ -1094,6 +1183,8 @@ class Motus(nn.Module):
         vlm_inputs=None,
         processed_t5_context: torch.Tensor = None,
         return_value_features: bool = False,
+        value_feature: str = "action_tokens",
+        value_vlm_mode: str = "mean_token",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """One Motus denoise velocity step shared by eval, train rollout, and actor logprob.
 
@@ -1128,7 +1219,19 @@ class Motus(nn.Module):
             )
 
         # Official Motus inference re-extracts understanding tokens inside each denoise step.
-        und_tokens = self.und_module.extract_und_features(vlm_inputs)
+        # When value_feature="vlm_tokens", reuse the same Qwen3-VL forward to expose
+        # raw VLM pooled features for OpenPI pi0.5-style value_after_vlm critic.
+        value_feature = str(value_feature).lower()
+        value_vlm_mode = str(value_vlm_mode).lower()
+        vlm_value_features = None
+        if return_value_features and value_feature == "vlm_tokens":
+            und_tokens, vlm_value_features = self.und_module.extract_und_features(
+                vlm_inputs,
+                return_vlm_value_features=True,
+                value_vlm_mode=value_vlm_mode,
+            )
+        else:
+            und_tokens = self.und_module.extract_und_features(vlm_inputs)
 
         if processed_t5_context is None:
             processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
@@ -1193,7 +1296,17 @@ class Motus(nn.Module):
                 action_value_tokens = action_tokens[:, 1:up_len, :]
 
         if return_value_features:
-            value_features = action_value_tokens.mean(dim=1).float()
+            if value_feature == "vlm_tokens":
+                if vlm_value_features is None:
+                    raise RuntimeError("value_feature='vlm_tokens' requested but VLM value features were not computed.")
+                value_features = vlm_value_features.float()
+            elif value_feature == "action_tokens":
+                value_features = action_value_tokens.mean(dim=1).float()
+            else:
+                raise ValueError(
+                    f"Unsupported Motus value_feature={value_feature!r}. "
+                    "Supported values: action_tokens, vlm_tokens."
+                )
             return video_velocity, action_velocity, und_tokens, value_features
 
         return video_velocity, action_velocity, und_tokens
@@ -1214,6 +1327,8 @@ class Motus(nn.Module):
         ignore_first: bool = False,
         ignore_last: bool = False,
         return_value_features: bool = False,
+        value_feature: str = "action_tokens",
+        value_vlm_mode: str = "mean_token",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Joint inference for video and action prediction.
 
@@ -1248,6 +1363,8 @@ class Motus(nn.Module):
         else:
             trace_step = -1
         logprob_mode = str(logprob_mode).lower()
+        value_feature = str(value_feature).lower()
+        value_vlm_mode = str(value_vlm_mode).lower()
 
         first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
         with torch.no_grad():
@@ -1275,6 +1392,7 @@ class Motus(nn.Module):
         video_chains: list[torch.Tensor] = []
         action_chains: list[torch.Tensor] = []
         value_features_steps: list[torch.Tensor] = []
+        vlm_value_features_static: Optional[torch.Tensor] = None
         if return_trace:
             video_chains.append(video_latent.detach().clone())
             action_chains.append(action_latent.detach().clone())
@@ -1309,10 +1427,16 @@ class Motus(nn.Module):
                 vlm_inputs=vlm_inputs,
                 processed_t5_context=processed_t5_context,
                 return_value_features=return_trace and return_value_features,
+                value_feature=value_feature,
+                value_vlm_mode=value_vlm_mode,
             )
             if return_trace and return_value_features:
                 video_velocity, action_velocity, _und_tokens, value_features = denoise_out
-                value_features_steps.append(value_features.detach().clone())
+                if value_feature == "vlm_tokens":
+                    if vlm_value_features_static is None:
+                        vlm_value_features_static = value_features.detach().clone()
+                else:
+                    value_features_steps.append(value_features.detach().clone())
             else:
                 video_velocity, action_velocity, _und_tokens = denoise_out
 
@@ -1347,11 +1471,16 @@ class Motus(nn.Module):
             trace["video_chains"] = torch.stack(video_chains, dim=1)
             trace["action_chains"] = torch.stack(action_chains, dim=1)
             if return_value_features:
-                if len(value_features_steps) != num_inference_steps:
-                    raise RuntimeError(
-                        f"Expected {num_inference_steps} value-feature steps, got {len(value_features_steps)}"
-                    )
-                trace["value_features"] = torch.stack(value_features_steps, dim=1)
+                if value_feature == "vlm_tokens":
+                    if vlm_value_features_static is None:
+                        raise RuntimeError("Expected VLM value features but none were captured.")
+                    trace["value_features"] = vlm_value_features_static
+                else:
+                    if len(value_features_steps) != num_inference_steps:
+                        raise RuntimeError(
+                            f"Expected {num_inference_steps} value-feature steps, got {len(value_features_steps)}"
+                        )
+                    trace["value_features"] = torch.stack(value_features_steps, dim=1)
 
         predicted_frames = None
         if decode_video:

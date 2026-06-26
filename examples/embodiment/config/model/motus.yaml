@@ -51,6 +51,10 @@ motus:
   ignore_first: False
   ignore_last: False
 
-  # PPO critic, aligned with OpenPI's action-suffix value path.
+  # PPO critic. Defaults keep the OpenPI pi0-style action-suffix value path.
+  # PPO experiments can set value_after_vlm=True and value_feature="vlm_tokens"
+  # to mirror OpenPI pi0.5 value_after_vlm critic.
   detach_critic_input: True
+  value_after_vlm: False
   value_feature: "action_tokens"
+  value_vlm_mode: "mean_token"

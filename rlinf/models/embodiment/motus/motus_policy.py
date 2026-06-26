@@ -90,11 +90,25 @@ class MotusPolicy(nn.Module, BasePolicy):
         self.ignore_last = _as_bool(motus_cfg.get("ignore_last", False), default=False)
         self.add_value_head = _as_bool(cfg.get("add_value_head", False), default=False)
         self.detach_critic_input = _as_bool(motus_cfg.get("detach_critic_input", True), default=True)
+        self.value_after_vlm = _as_bool(motus_cfg.get("value_after_vlm", False), default=False)
         self.value_feature = str(motus_cfg.get("value_feature", "action_tokens")).lower()
-        if self.value_feature != "action_tokens":
+        self.value_vlm_mode = str(motus_cfg.get("value_vlm_mode", "mean_token")).lower()
+        # Match OpenPI pi0.5 ergonomics: value_after_vlm=True is the primary
+        # knob. If the caller leaves value_feature at its default, promote it to
+        # the VLM feature path instead of requiring duplicated config.
+        if self.value_after_vlm and self.value_feature == "action_tokens":
+            self.value_feature = "vlm_tokens"
+        if self.value_feature == "vlm_tokens" and not self.value_after_vlm:
+            self.value_after_vlm = True
+        if self.value_feature not in {"action_tokens", "vlm_tokens"}:
             raise ValueError(
                 f"Unsupported Motus value_feature={self.value_feature!r}. "
-                "OpenPI-aligned PPO currently uses action_tokens."
+                "Supported values: action_tokens, vlm_tokens."
+            )
+        if self.value_vlm_mode not in {"mean_token", "first_token", "last_token"}:
+            raise ValueError(
+                f"Unsupported Motus value_vlm_mode={self.value_vlm_mode!r}. "
+                "Supported values: mean_token, first_token, last_token."
             )
 
         if not self.policy_path.exists():
@@ -130,14 +144,21 @@ class MotusPolicy(nn.Module, BasePolicy):
         # Expose official Motus nn.Module as a submodule so RLinf Actor/FSDP/optimizer/checkpoint can see it.
         self.model = self._policy.model
         if self.add_value_head:
-            value_input_dim = int(getattr(self.model.config, "action_expert_dim", 1024))
+            value_input_dim, value_hidden_sizes = self._get_value_head_spec()
             self.value_head = ValueHead(
                 input_dim=value_input_dim,
-                hidden_sizes=(512, 256, 128),
+                hidden_sizes=value_hidden_sizes,
                 output_dim=1,
                 activation="relu",
                 bias_last=True,
             ).to(self.device)
+            print(
+                f"[RLinf-Motus] value_head feature={self.value_feature}, "
+                f"value_after_vlm={self.value_after_vlm}, "
+                f"input_dim={value_input_dim}, hidden_sizes={value_hidden_sizes}, "
+                f"value_vlm_mode={self.value_vlm_mode}",
+                flush=True,
+            )
         self._configure_trainable_parameters()
 
         # Make YAML-level inference-step override effective. The official wrapper
@@ -148,6 +169,24 @@ class MotusPolicy(nn.Module, BasePolicy):
             ] = self.num_inference_timesteps
         except Exception:
             pass
+
+    def _get_value_head_spec(self) -> tuple[int, tuple[int, ...]]:
+        """Return ValueHead dimensions for the selected Motus critic feature.
+
+        action_tokens mirrors OpenPI pi0 action-suffix critic.
+        vlm_tokens mirrors OpenPI pi0.5 value_after_vlm=True critic.
+        """
+        if self.value_feature == "vlm_tokens":
+            input_dim = int(getattr(self.model.config, "vlm_adapter_input_dim", 2048))
+            if input_dim != 2048:
+                raise ValueError(
+                    "OpenPI pi0.5-style Motus VLM critic expects raw VLM hidden dim 2048, "
+                    f"got {input_dim}."
+                )
+            return input_dim, (1024, 512, 256)
+        if self.value_feature == "action_tokens":
+            return int(getattr(self.model.config, "action_expert_dim", 1024)), (512, 256, 128)
+        raise ValueError(f"Unsupported Motus value_feature={self.value_feature!r}")
 
     def _load_official_deploy_policy(self):
         deploy_path = self.policy_path / "deploy_policy.py"
@@ -350,6 +389,8 @@ class MotusPolicy(nn.Module, BasePolicy):
             action_dim=self.action_dim,
             compute_values=compute_values,
             return_value_features=compute_values,
+            value_feature=self.value_feature,
+            value_vlm_mode=self.value_vlm_mode,
         )
         values = self._compute_values_from_features(value_features) if compute_values else None
 
@@ -366,12 +407,12 @@ class MotusPolicy(nn.Module, BasePolicy):
         return out
 
     def _compute_values_from_features(self, value_features: torch.Tensor | None) -> torch.Tensor:
-        """Compute PPO critic values from Motus action-token features.
+        """Compute PPO critic values from Motus value features.
 
-        OpenPI computes critic values from action suffix features. Motus mirrors
-        that by pooling action-expert tokens from the replayed denoise step; the
-        third-party Motus model returns those pooled features, while the RLinf
-        adapter owns the ValueHead so RLinf/FSDP/optimizer can see it directly.
+        action_tokens mirrors OpenPI pi0 action-suffix critic and may arrive as
+        [B,S,1024] for rollout or [B,1024] for selected-step replay.
+        vlm_tokens mirrors OpenPI pi0.5 value_after_vlm=True and arrives as
+        [B,2048], independent of denoise step.
         """
         if not self.add_value_head or not hasattr(self, "value_head"):
             raise NotImplementedError(
@@ -645,6 +686,8 @@ class MotusPolicy(nn.Module, BasePolicy):
             logprob_mode=self.logprob_mode,
             logprob_sigma=self.logprob_sigma,
             decode_video=False,
+            value_feature=self.value_feature,
+            value_vlm_mode=self.value_vlm_mode,
         )
         if "ignore_first" in sig.parameters:
             call_kwargs["ignore_first"] = self.ignore_first
@@ -655,6 +698,11 @@ class MotusPolicy(nn.Module, BasePolicy):
                 raise RuntimeError(
                     "Motus PPO requires inference_step(return_value_features=...). "
                     "Update third_party/Motus/models/motus.py."
+                )
+            if "value_feature" not in sig.parameters or "value_vlm_mode" not in sig.parameters:
+                raise RuntimeError(
+                    "Motus PPO VLM critic requires inference_step(value_feature=..., "
+                    "value_vlm_mode=...). Update third_party/Motus/models/motus.py."
                 )
             call_kwargs["return_value_features"] = True
 
@@ -703,12 +751,15 @@ class MotusPolicy(nn.Module, BasePolicy):
             action_dim=self.action_dim,
             compute_values=compute_values,
             return_value_features=compute_values,
+            value_feature=self.value_feature,
+            value_vlm_mode=self.value_vlm_mode,
         )
         prev_logprobs = prev_logprobs.detach().float().cpu().contiguous()
         prev_values = None
         if compute_values:
-            # Match OpenPI rollout behavior: compute a value for each denoise
-            # step during sampling, then average values over the denoise dimension.
+            # action_tokens returns per-denoise-step features [B,S,H] and is averaged
+            # by _compute_values_from_features(). vlm_tokens returns observation-side
+            # features [B,H], matching OpenPI pi0.5 value_after_vlm=True semantics.
             prev_values = self._compute_values_from_features(trace["value_features"]).detach().float().cpu().contiguous()
 
         forward_inputs = {
@@ -733,7 +784,7 @@ class MotusPolicy(nn.Module, BasePolicy):
             "motus_video_chains": trace["video_chains"].detach().float().cpu().contiguous(),
             "motus_denoise_inds": trace["denoise_inds"].detach().cpu().contiguous(),
 
-            # OpenPI-style PPO rollout values use per-denoise-step value features.
+            # PPO rollout value features: action_tokens -> [B,S,1024]; vlm_tokens -> [B,2048].
             **({
                 "motus_value_features": trace["value_features"].detach().float().cpu().contiguous(),
             } if self.add_value_head else {}),
